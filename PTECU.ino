@@ -103,7 +103,7 @@ void setup() {
     if (SD.begin(SD_CS)) {
         int n = 1;
         while (n < 1000) {
-            sprintf(nomeArquivo, "/CVT_%d.csv", n);
+            sprintf(nomeArquivo, "/PTECU_%d.csv", n);
             if (!SD.exists(nomeArquivo)) break;
             n++;
         }
