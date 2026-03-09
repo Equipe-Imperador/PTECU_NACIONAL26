@@ -7,12 +7,12 @@
 #include <esp_task_wdt.h>
 
 // --- 1. CONFIGURAÇÃO DE TAXAS (em Milissegundos) ---
-#define TAXA_RPM_MS        25   // 20ms = 40Hz 8 pontos por frenagem 
-#define TAXA_VELOCIDADE_MS 25   // 20ms = 40Hz
-#define TAXA_TEMP_CVT_MS   200  // 200ms = 5Hz
-#define TAXA_ENVIO_CAN_MS  25   // 40Hz (Acompanha a atualização rápida)
+#define TAXA_RPM_MS        25   
+#define TAXA_VELOCIDADE_MS 25   
+#define TAXA_TEMP_CVT_MS   200  
+#define TAXA_ENVIO_CAN_MS  25   
 
-// --- 2. Estrutura de Dados e Sincronismo ---
+// --- 2. Estrutura de Dados ---
 struct DadosTelemetria {
     uint32_t timestamp;
     float rpm;
@@ -24,22 +24,25 @@ DadosTelemetria estadoAtual;
 SemaphoreHandle_t xMutexEstado; 
 QueueHandle_t filaSD;
 File dataFile;
-char nomeArquivo[20];
+char nomeArquivo[30];
 
 // --- 3. Pinos e Hardware ---
 const int PIN_RPM = 35;
 const int PIN_VEL = 32;
 
-// SPI CAN (HSPI)
+// CAN (Pinos HSPI - Usando barramento SPI padrão)
 #define CAN_CS 15
 #define CAN_SCK 14
 #define CAN_MISO 12
 #define CAN_MOSI 13
-SPIClass SPI_CAN(HSPI);
 MCP_CAN CAN0(CAN_CS);
 
-// SPI SD (VSPI padrão)
+// SD CARD (Pinos VSPI - Usando instância dedicada como na MECU)
 #define SD_CS 5
+#define SD_SCK 18
+#define SD_MISO 19
+#define SD_MOSI 23
+SPIClass sdSPI(VSPI);
 
 // I2C para MLX90614
 #define I2C_SDA 21
@@ -81,9 +84,9 @@ void IRAM_ATTR isrVEL() {
 }
 
 // --- 5. Protótipos das Tasks ---
-void vTaskRPM(void *pvParameters);         // 50Hz
-void vTaskVelocidade(void *pvParameters);  // 50Hz
-void vTaskTempCVT(void *pvParameters);     // 5Hz
+void vTaskRPM(void *pvParameters);
+void vTaskVelocidade(void *pvParameters);
+void vTaskTempCVT(void *pvParameters);
 void vTaskSD(void *pvParameters);
 void vTaskCAN(void *pvParameters);
 void enviarMsgCAN(long id, float valor);
@@ -93,22 +96,32 @@ void enviarMsgCAN(long id, float valor);
 // -------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
+    Serial.println("\n PTECU INICIALIZANDO ");
 
-    Wire.begin(I2C_SDA, I2C_SCL);
-    if (!mlx.begin()) {
-        Serial.println("Erro: Sensor MLX90614 nao detectado!");
-    }
-
-    pinMode(PIN_RPM, INPUT_PULLUP);
+    // 1. Configuração de Pinos de Entrada (35 não aceita PULLUP interno)
+    pinMode(PIN_RPM, INPUT); 
     pinMode(PIN_VEL, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(PIN_RPM), isrRPM, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_VEL), isrVEL, FALLING);
 
-    SPI_CAN.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
-    while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) { delay(500); }
-    CAN0.setMode(MCP_NORMAL);
+    // 2. I2C
+    Wire.begin(I2C_SDA, I2C_SCL);
+    mlx.begin();
 
-    if (SD.begin(SD_CS)) {
+    // 3. Inicialização CAN (HSPI)
+    SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
+    if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
+        Serial.println(" Erro Critico: Falha no MCP2515 (CAN)!");
+    } else {
+        CAN0.setMode(MCP_NORMAL);
+        Serial.println(" CAN Inicializada.");
+    }
+
+    // 4. Inicialização SD (VSPI)
+    sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    if (!SD.begin(SD_CS, sdSPI)) {
+        Serial.println(" Erro Critico: Falha no Cartao SD!");
+    } else {
         int n = 1;
         while (n < 1000) {
             sprintf(nomeArquivo, "/PTECU_%d.csv", n);
@@ -119,42 +132,41 @@ void setup() {
         if (dataFile) {
             dataFile.println("ms;rpm;vel;temp_cvt");
             dataFile.flush();
+            Serial.printf(" SD Inicializado: %s\n", nomeArquivo);
         }
     }
 
-    // Inicializa Mutex e Fila
+    // 5. Mutex e Fila
     xMutexEstado = xSemaphoreCreateMutex();
-    filaSD = xQueueCreate(100, sizeof(DadosTelemetria)); // Aumentado para 100 pois 50Hz enche rápido
+    filaSD = xQueueCreate(100, sizeof(DadosTelemetria));
 
+    // 6. Configuração do Watchdog (Ajuste para evitar erro de re-inicialização)
     esp_task_wdt_config_t twdt_config = {
-        .timeout_ms = 5000,
+        .timeout_ms = 8000,
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
         .trigger_panic = true
     };
-    esp_task_wdt_init(&twdt_config);
+    esp_task_wdt_reconfigure(&twdt_config); // Usa reconfigure em vez de init
 
-    // --- Criação das Tasks ---
-    // Core 0: Leituras Matemáticas
-    xTaskCreatePinnedToCore(vTaskRPM,        "RPM", 3072, NULL, 4, NULL, 0); 
+    // 7. Criação das Tasks
+    xTaskCreatePinnedToCore(vTaskRPM,         "RPM", 3072, NULL, 4, NULL, 0); 
     xTaskCreatePinnedToCore(vTaskVelocidade, "VEL", 3072, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskTempCVT,    "CVT", 2048, NULL, 2, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskSD,         "SD",  4096, NULL, 1, NULL, 0);
-
-    // Core 1: CAN
-    xTaskCreatePinnedToCore(vTaskCAN, "CAN", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(vTaskTempCVT,     "CVT", 2048, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskSD,          "SD",  4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskCAN,         "CAN", 4096, NULL, 3, NULL, 1);
 }
 
 void loop() { vTaskDelete(NULL); }
 
 // -------------------------------------------------------------------
-// TAREFA 1: RPM (50Hz)
+// TAREFAS
 // -------------------------------------------------------------------
+
 void vTaskRPM(void *pvParameters) {
     for (;;) {
         unsigned long agora_us = micros();
         unsigned long dR, lR;
 
-        // Cópia rápida das variáveis para não travar a interrupção
         noInterrupts();
         dR = deltaRPM; 
         lR = lastISR_RPM;
@@ -165,8 +177,6 @@ void vTaskRPM(void *pvParameters) {
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
         estadoAtual.timestamp = millis();
         estadoAtual.rpm = calc_rpm;
-        
-        // A tarefa RPM "empurra" o estado global para a fila do SD (50 vezes por segundo)
         xQueueSend(filaSD, &estadoAtual, 0);
         xSemaphoreGive(xMutexEstado);
 
@@ -174,9 +184,6 @@ void vTaskRPM(void *pvParameters) {
     }
 }
 
-// -------------------------------------------------------------------
-// TAREFA 2: VELOCIDADE (50Hz)
-// -------------------------------------------------------------------
 void vTaskVelocidade(void *pvParameters) {
     for (;;) {
         unsigned long agora_us = micros();
@@ -187,6 +194,7 @@ void vTaskVelocidade(void *pvParameters) {
         lV = lastISR_VEL;
         interrupts();
 
+        // Correção do nome da constante COMPRIMENTO_RODA
         float calc_vel = (agora_us - lV > TIMEOUT_US) ? 0 : ((1000000.0f * COMPRIMENTO_RODA * 3.6f) / (dV * REDUCAO_FIXA * DENTES_EIXO_2));
 
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
@@ -197,12 +205,8 @@ void vTaskVelocidade(void *pvParameters) {
     }
 }
 
-// -------------------------------------------------------------------
-// TAREFA 3: TEMPERATURA CVT (5Hz)
-// -------------------------------------------------------------------
 void vTaskTempCVT(void *pvParameters) {
     for (;;) {
-        // Leitura do I2C (demora um pouquinho mais, por isso roda a 5Hz separado)
         float temp = mlx.readObjectTempC();
         if (isnan(temp)) temp = -99.9;
 
@@ -214,9 +218,6 @@ void vTaskTempCVT(void *pvParameters) {
     }
 }
 
-// -------------------------------------------------------------------
-// TAREFA 4: SD DATALOGGER
-// -------------------------------------------------------------------
 void vTaskSD(void *pvParameters) {
     DadosTelemetria p;
     int counter = 0;
@@ -224,8 +225,6 @@ void vTaskSD(void *pvParameters) {
         if (xQueueReceive(filaSD, &p, portMAX_DELAY)) {
             if (dataFile) {
                 dataFile.printf("%u;%.0f;%.1f;%.1f\n", p.timestamp, p.rpm, p.velocidade, p.tempCVT);
-                
-                // Flush a cada 40 gravações = 1 vez por segundo
                 if (++counter >= 40) { 
                     dataFile.flush(); 
                     counter = 0; 
@@ -235,9 +234,6 @@ void vTaskSD(void *pvParameters) {
     }
 }
 
-// -------------------------------------------------------------------
-// TAREFA 5: CAN (50Hz)
-// -------------------------------------------------------------------
 void vTaskCAN(void *pvParameters) {
     esp_task_wdt_add(NULL);
     for (;;) {
