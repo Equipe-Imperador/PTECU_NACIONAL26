@@ -24,6 +24,7 @@
 // Sensores
 const int PIN_RPM = 35;
 const int PIN_VEL = 32;
+const int PIN_PRESSAO = 33;
 
 // Instâncias
 MCP_CAN CAN0(CAN_CS);        // Vai usar o SPI global
@@ -38,6 +39,7 @@ struct DadosTelemetria {
     float rpm;
     float velocidade;
     float tempCVT;
+    float pressaoT;
 } estadoAtual;
 
 SemaphoreHandle_t xMutexEstado; 
@@ -45,18 +47,23 @@ QueueHandle_t filaSD;
 File dataFile;
 char nomeArquivo[30];
 
-#define DIAMETRO 0.54f
+// Constantes de Cálculo (Dinâmica)
+#define DIAMETRO 0.544f
 #define COMPRIMENTO_RODA (3.14159f * DIAMETRO)
-#define REDUCAO_FIXA 9.0f
+#define REDUCAO_FIXA 9.57f
 const unsigned long TIMEOUT_US = 500000;
 const int DENTES_EIXO_1 = 1;
-const int DENTES_EIXO_2 = 3;
+const int DENTES_EIXO_2 = 6;
+
+// Constantes Pressão
+const float FATOR_DIVISOR_PRESSAO = 1.66667f; 
+const float MULTIPLICADOR_PSI = 400.0f; 
 
 volatile unsigned long deltaRPM = 0, deltaVEL = 0;
 volatile unsigned long lastISR_RPM = 0, lastISR_VEL = 0;
 
 // ====================================================================
-// 3. INTERRUPÇÕES
+// 3. INTERRUPÇÕES E PROTÓTIPOS
 // ====================================================================
 void IRAM_ATTR isrRPM() {
     unsigned long agora = micros();
@@ -74,11 +81,17 @@ void IRAM_ATTR isrVEL() {
     }
 }
 
+// Tarefas
 void vTaskRPM(void *pvParameters);
 void vTaskVelocidade(void *pvParameters);
 void vTaskTempCVT(void *pvParameters);
+void vTaskPressao(void *pvParameters);
 void vTaskSD(void *pvParameters);
 void vTaskCAN(void *pvParameters);
+
+// Auxiliares
+float lerPressaoPSI(int pino);
+void enviarMsgCAN(uint32_t id, float valor);
 
 // ====================================================================
 // 4. SETUP
@@ -97,8 +110,7 @@ void setup() {
     digitalWrite(SD_CS, HIGH);
 
     // --- A. BARRAMENTO 1: CAN (Usando objeto SPI Global) ---
-    // Mapeia o SPI padrão para os pinos do HSPI (14, 12, 13, 15)
-    SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
+    SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, -1);
     
     Serial.print("Iniciando CAN... ");
     if (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) == CAN_OK) {
@@ -109,12 +121,10 @@ void setup() {
     }
 
     // --- B. BARRAMENTO 2: SD CARD (Usando objeto sdSPI isolado) ---
-    // Mapeia o VSPI para os pinos do SD (18, 19, 23, 5)
-    sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, -1);
     
     Serial.print("Iniciando SD... ");
-    // Passamos o sdSPI explicitly para a biblioteca do cartão
-    if (!SD.begin(SD_CS, sdSPI, 4000000)) { 
+    if (!SD.begin(SD_CS, sdSPI, 1000000)) { 
         Serial.println("!!! FALHA OU AUSENTE !!!");
     } else {
         int n = 1;
@@ -125,7 +135,8 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            dataFile.println("ms;rpm;vel;temp_cvt");
+            // Cabeçalho atualizado com pressao_t
+            dataFile.println("ms;rpm;vel;temp_cvt;pressao_t");
             dataFile.flush();
             Serial.printf(">>> SUCESSO: Gravando em %s\n", nomeArquivo);
         }
@@ -143,18 +154,39 @@ void setup() {
     esp_task_wdt_reconfigure(&twdt_config);
 
     // --- D. TASKS ---
-    xTaskCreatePinnedToCore(vTaskRPM,         "RPM", 3072, NULL, 4, NULL, 0); 
-    xTaskCreatePinnedToCore(vTaskVelocidade, "VEL", 3072, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskTempCVT,     "CVT", 2048, NULL, 2, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskSD,          "SD",  4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskCAN,         "CAN", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(vTaskRPM,         "RPM",  3072, NULL, 4, NULL, 0); 
+    xTaskCreatePinnedToCore(vTaskPressao,     "PRES", 3072, NULL, 4, NULL, 0); 
+    xTaskCreatePinnedToCore(vTaskVelocidade,  "VEL",  3072, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskTempCVT,     "CVT",  4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskSD,          "SD",   4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskCAN,         "CAN",  4096, NULL, 5, NULL, 1);
 }
 
-void loop() { vTaskDelete(NULL); }
+void loop() {
+    // 1. Fazemos a cópia local para liberar o Mutex rapidamente
+    xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+    DadosTelemetria debugDados = estadoAtual; 
+    xSemaphoreGive(xMutexEstado);
+
+    // 2. Imprime os dados formatados na Serial
+    Serial.printf("RPM: %.0f | Vel: %.1f km/h | Temp CVT: %.1f °C | Pressão: %.2f PSI\n", 
+                   debugDados.rpm, debugDados.velocidade, debugDados.tempCVT, debugDados.pressaoT); 
+
+    // 3. Aguarda 1 segundo (1Hz) para não floodar o terminal
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
+}
 
 // ====================================================================
-// 5. TASKS E LÓGICA
+// 5. FUNÇÕES E CÁLCULOS AUXILIARES
 // ====================================================================
+float lerPressaoPSI(int pino) {
+    float tensaoPino = analogReadMilliVolts(pino) / 1000.0f;
+    float tensaoSensor = tensaoPino * FATOR_DIVISOR_PRESSAO;
+
+    if (tensaoSensor < 0.5f) tensaoSensor = 0.5f;
+    return (tensaoSensor - 0.5f) * MULTIPLICADOR_PSI;
+}
+
 void enviarMsgCAN(uint32_t id, float valor) {
     int16_t valorInt = (int16_t)(valor * 100.0f);
     if (id == 0x200) valorInt = (int16_t)valor;
@@ -165,12 +197,13 @@ void enviarMsgCAN(uint32_t id, float valor) {
     byte sndStat = CAN0.sendMsgBuf(id, 0, 2, data);
 
     if(sndStat != CAN_OK) {
-        // Opcional: Descomente para ver erros de fiação (Stat 6)
-         Serial.printf("[!] Erro CAN ID 0x%X: Stat %d\n", id, sndStat);
         if(sndStat == 6) CAN0.setMode(MCP_NORMAL); 
     }
 }
 
+// ====================================================================
+// 6. LÓGICA DAS TASKS
+// ====================================================================
 void vTaskCAN(void *pvParameters) {
     esp_task_wdt_add(NULL);
     for (;;) {
@@ -183,6 +216,7 @@ void vTaskCAN(void *pvParameters) {
         enviarMsgCAN(0x200, p.rpm);
         enviarMsgCAN(0x201, p.velocidade);
         enviarMsgCAN(0x202, p.tempCVT);
+        enviarMsgCAN(0x203, p.pressaoT); // Envio da pressão adicionado
 
         vTaskDelay(pdMS_TO_TICKS(25));
     }
@@ -195,13 +229,27 @@ void vTaskSD(void *pvParameters) {
         if (xQueueReceive(filaSD, &p, portMAX_DELAY)) {
             if (dataFile) {
                 // A gravação usará o sdSPI (VSPI) isolado
-                dataFile.printf("%u;%.0f;%.1f;%.1f\n", p.timestamp, p.rpm, p.velocidade, p.tempCVT);
+                dataFile.printf("%u;%.0f;%.1f;%.1f;%.2f\n", 
+                                p.timestamp, p.rpm, p.velocidade, p.tempCVT, p.pressaoT);
                 if (++contadorFlush >= 20) { 
                     dataFile.flush(); 
                     contadorFlush = 0; 
                 }
             }
         }
+    }
+}
+
+void vTaskPressao(void *pvParameters) {
+    for (;;) {
+        float calc_pressao = lerPressaoPSI(PIN_PRESSAO);
+        
+        xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+        estadoAtual.pressaoT = calc_pressao;
+        xSemaphoreGive(xMutexEstado);
+        
+        // Atualiza a 10Hz (a fila para o SD continuará sendo alimentada pela vTaskRPM)
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
 }
 
@@ -217,8 +265,9 @@ void vTaskRPM(void *pvParameters) {
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
         estadoAtual.timestamp = millis();
         estadoAtual.rpm = calc_rpm;
-        xQueueSend(filaSD, &estadoAtual, 0);
+        xQueueSend(filaSD, &estadoAtual, 0); // Envia o snapshot completo para o SD
         xSemaphoreGive(xMutexEstado);
+        
         vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
@@ -235,6 +284,7 @@ void vTaskVelocidade(void *pvParameters) {
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
         estadoAtual.velocidade = calc_vel;
         xSemaphoreGive(xMutexEstado);
+        
         vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
@@ -243,9 +293,11 @@ void vTaskTempCVT(void *pvParameters) {
     for (;;) {
         float temp = mlx.readObjectTempC();
         if (isnan(temp)) temp = -99.9;
+        
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
         estadoAtual.tempCVT = temp;
         xSemaphoreGive(xMutexEstado);
+        
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
